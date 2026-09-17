@@ -28,7 +28,11 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 300
+    # A cold x86 Release run - bootstrap, sync, compile, verify - is ~11 minutes
+    # on 32 cores, of which 7 is ninja. A hosted runner has 4 cores, so budget
+    # an hour or two. Generous rather than tight: a timeout loses the whole run,
+    # and GitHub's hard ceiling is 360 anyway.
+    timeout-minutes: 240
 
     steps:
       - uses: actions/checkout@v4
@@ -53,14 +57,17 @@ jobs:
 
       # The build root is outside the workspace; depot_tools and the V8 checkout
       # are large and unrelated to the repo contents.
-      - name: Build
+      # -Verify links and runs a DLL against the result, so a library that
+      # archives cleanly but cannot initialise fails here, not in a consumer.
+      - name: Build and verify
         shell: pwsh
         run: |
           .\build-v8.ps1 `
             -Root C:\v8b `
             -Version ${{ inputs.version }} `
             -Arch ${{ inputs.arch }} `
-            -Config ${{ inputs.config }}
+            -Config ${{ inputs.config }} `
+            -Verify
 
       - name: Zip the distribution
         shell: pwsh
@@ -69,6 +76,7 @@ jobs:
           $name = "v8-${{ inputs.version }}-$tag"
           $dist = "C:\v8b\dist-$tag"
           if (-not (Test-Path "$dist\v8_monolith.lib")) { throw "no library at $dist" }
+          if (-not (Test-Path "$dist\include\v8-gn.h"))  { throw "no v8-gn.h at $dist" }
           Compress-Archive -Path "$dist\*" -DestinationPath "$env:GITHUB_WORKSPACE\$name.zip" -CompressionLevel Optimal
           "{0} {1:N0} MB" -f "$name.zip", ((Get-Item "$env:GITHUB_WORKSPACE\$name.zip").Length/1MB)
 
@@ -114,8 +122,13 @@ jobs:
               --notes "Monolithic V8 static libraries built against the static CRT (\`/MT\`).
 
           Each archive contains \`v8_monolith.lib\`, \`include/\` and a \`README.txt\`.
-          Link \`winmm.lib dbghelp.lib advapi32.lib shlwapi.lib\` alongside it, and match
+          Compile with \`/DV8_GN_HEADER\` so the public headers pick up the bundled
+          \`include/v8-gn.h\` and lay objects out the way the library does. Link
+          \`winmm.lib dbghelp.lib advapi32.lib shlwapi.lib\` alongside it, and match
           the CRT: \`/MT\` for Release, \`/MTd\` for Debug.
+
+          Each configuration was verified by linking a DLL against it, confirming zero
+          dynamic-CRT imports, and evaluating JavaScript through it.
 
           Note 32-bit builds are capped at V8 14.8.x - see the repository README." \
               *.zip

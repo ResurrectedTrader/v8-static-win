@@ -5,7 +5,7 @@ Build V8 on Windows as a **monolithic static library** linked against the
 `vcruntime140.dll` / `msvcp140.dll` dependency.
 
 ```powershell
-.\build-v8.ps1 -Root C:\v8b -Version 14.8.180 -Arch x86 -Config Release
+.\build-v8.ps1 -Root C:\v8b -Version 14.8.180 -Arch x86 -Config Release -Verify
 ```
 
 Output per configuration, under `dist-<arch>-<config>\`:
@@ -13,11 +13,46 @@ Output per configuration, under `dist-<arch>-<config>\`:
 | File | Purpose |
 |---|---|
 | `v8_monolith.lib` | the engine, one archive |
-| `include\` | V8's public headers |
-| `README.txt` | the CRT and system libs a consumer needs |
+| `include\` | V8's public headers, plus the generated `v8-gn.h` |
+| `README.txt` | the defines, CRT and system libs a consumer needs |
 
 Unlike SpiderMonkey, **no packaging step is needed** — `v8_monolithic = true`
 emits a genuine self-contained archive.
+
+`-Verify` compiles a small embedder against the result, links it into a DLL, and
+evaluates JavaScript through it. CI always passes it.
+
+## Consuming the result
+
+Compile with **`/DV8_GN_HEADER`** and `include\` on the include path. Nothing
+else is required.
+
+That one define is load-bearing. V8's public headers are configured by macros
+the GN build passes on the command line, and an embedder that does not repeat
+them gets headers that lay objects out differently from the library it is
+linking. `v8_generate_external_defines_header = true` makes the build emit
+`include\v8-gn.h` carrying the exact set, and `v8config.h` includes it when
+`V8_GN_HEADER` is defined — so the set travels with the library instead of
+being reconstructed from the build arguments.
+
+For the x86 Release configuration the defaults differ from the build in at
+least three ways that a compiler cannot see:
+
+| Macro | Header default | This build |
+|---|---|---|
+| `V8_ARRAY_BUFFER_INTERNAL_FIELD_COUNT` | `2` | `0` |
+| `CPPGC_ENABLE_LARGER_CAGE` | off | on |
+| `CPPGC_SLIM_WRITE_BARRIER` | off | on |
+
+None of those produce a diagnostic. A spike that only evaluates an expression
+links and runs fine without the define; the damage shows up later, in embedder
+fields and in cppgc's inlined write barrier. `v8-gn.h` also `#error`s if you
+define something the build disabled, so a contradiction fails at compile time
+rather than at runtime.
+
+`V8::Initialize()` separately checks pointer compression, Smi width and the
+sandbox against the library and aborts on a mismatch — but that covers only
+those three.
 
 ## Version support
 
@@ -32,7 +67,8 @@ build is possible at all.
 | ≥ 15.x | ✅ | ❌ | also hardcodes a Windows SDK most machines do not have |
 
 **Verified**: 14.8.180 x86 Release — 1,038 MB monolith, `libcmt`/`libcpmt`, zero
-dynamic-CRT references.
+dynamic-CRT imports in a DLL linked against it, and `40 + 2 === 42` evaluated
+through that DLL.
 
 ### Why 32-bit stops at 14.8
 
@@ -85,7 +121,8 @@ affects 14.4 onwards.
 | Visual Studio with ClangCL | V8 builds with clang-cl, not MSVC proper |
 | Windows SDK | 10.0.26100.0 for 14.8.x; see the version table |
 | Python 3, git | depot_tools needs both |
-| ~25 GB disk | ~11 GB synced source, ~8 GB build output, ~1 GB library |
+| ~10 GB disk | measured cold, one x86 Release: 4.9 GB checkout, 2.7 GB build output, 1.0 GB library, 0.7 GB depot_tools |
+| ~11 min on 32 cores | cold, end to end; 7 of that is ninja. Budget an hour or two on 4 cores |
 
 depot_tools is fetched into `-Root` by the script.
 
@@ -97,7 +134,18 @@ depot_tools is fetched into `-Root` by the script.
 * **`DEPOT_TOOLS_WIN_TOOLCHAIN=0` is mandatory** for non-Googlers, or it tries to
   fetch Google's internal packaged toolchain instead of your Visual Studio.
 * **`DEPOT_TOOLS_UPDATE=0`** if depot_tools has local modifications — otherwise
-  its self-update fails and blocks every command.
+  its self-update fails and blocks every command. But setting it on a *fresh*
+  clone breaks the clone: a clone ships no Python, and the bootstrap that
+  installs it only runs from `update_depot_tools.bat`, which that variable
+  suppresses. `gclient` limps along, but `gn` and `autoninja` die with
+  `python3_bin_reldir.txt not found. need to initialize depot_tools by running
+  gclient or update_depot_tools`. The script runs `bootstrap\win_tools.bat`
+  directly once, before setting the variable.
+* **An existing depot_tools on `PATH` hijacks a second one.** `gclient.bat`
+  *appends* its own directory to `PATH` and then calls `vpython3` unqualified,
+  so a system-wide install runs this checkout's scripts under its interpreter —
+  which surfaces as an unrelated `ImportError` from `metrics_utils`. The script
+  prepends its own depot_tools to `PATH` for that reason.
 * **A version change needs a clean objdir.** `gn gen` happily reuses a populated
   one and the resulting errors point at V8's source rather than the stale output.
   The giveaway is hundreds of targets "building" in seconds. The script stamps
@@ -116,6 +164,7 @@ v8_static_library = true
 is_component_build = false      # this is what selects /MT
 v8_use_external_startup_data = false
 use_custom_libcxx = false       # MSVC's STL, not the bundled libc++
+v8_generate_external_defines_header = true   # emits include/v8-gn.h
 v8_enable_pointer_compression   # true on x64, unsupported on x86
 v8_enable_sandbox               # true on x64; needs the external code space,
                                 # which needs pointer compression
@@ -135,12 +184,39 @@ libraries. With Temporal enabled the monolith references its symbols without
 containing them, and the fix is to add it to the monolith's `deps`/`public_deps`
 by hand. Leaving the flag off avoids the problem.
 
+## Verification
+
+With `-Verify`, each configuration is checked once everything is packaged. The
+workflow always passes it. For each one the script:
+
+1. compiles a ~40-line embedder against `dist-<arch>-<config>\include` with
+   `/DV8_GN_HEADER` and the matching CRT flag, using **V8's own bundled
+   clang-cl** rather than Visual Studio's — the compiler that built the library
+   cannot disagree with it about ABI;
+2. links it into a DLL against `v8_monolith.lib` with `lld-link`;
+3. walks the DLL's PE import table and fails if anything matching
+   `vcruntime` / `msvcp` / `msvcr` / `api-ms-win-crt` appears. The table is
+   parsed directly rather than through `dumpbin` or `llvm-readobj`, neither of
+   which the build otherwise needs;
+4. loads the DLL from a host process of the right bitness (a 32-bit DLL needs
+   32-bit PowerShell) and calls into it, which initialises V8, creates an
+   isolate and a context, and evaluates `40 + 2`.
+
+Step 4 is the one that matters. An archive can be well-formed, correctly sized
+and full of the right symbols while still being unable to initialise — the
+CRT-directive check alone never catches that.
+
 ## Continuous integration
 
 `.github/workflows/build.yml` is `workflow_dispatch` only. The output changes
 only when the pinned V8 version does, so consumers download published assets
 rather than building.
 
-Disk is the constraint: ~11 GB of synced source plus ~8 GB of build output for
-one x86 Release configuration, against roughly 33 GB free on a hosted runner. A
-64-bit Debug build is close to twice the output and may not fit.
+Neither disk nor time is especially tight. A cold x86 Release run measures
+**9.3 GB** all in against the ~33 GB free on a hosted runner, and **~11 minutes**
+on 32 cores — 7 of which is ninja. A runner has 4 cores, so expect an hour or
+two; `timeout-minutes` is set well above that rather than close to it, because
+a timeout loses the whole run. A 64-bit Debug build is larger on both axes.
+
+Most of the disk saving is the shallow clone: V8's full history is ~2 GB of
+`.git` against 36 MB for a single tag.

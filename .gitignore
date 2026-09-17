@@ -2,3 +2,10 @@
 /dist-*/
 /out-*/
 *.log
+
+# Only reachable if someone points -Root at the repo itself; the build root is
+# normally outside it. Listed so a stray run cannot stage ~20 GB.
+/depot_tools/
+/v8/
+/verify-*/
+/.gclient*
