@@ -1,7 +1,7 @@
 name: Build V8
 
 # Manual: the output only changes when the pinned V8 version does, and a sync
-# alone pulls ~11 GB. Consumers download the published assets.
+# alone pulls several GB. Consumers download the published assets.
 on:
   workflow_dispatch:
     inputs:
@@ -10,46 +10,100 @@ on:
         type: string
         required: true
         default: 14.8.180
-      arch:
-        description: Target architecture
+      configurations:
+        description: What to build
         type: choice
-        options: [x86, x64]
-        default: x86
-      config:
-        description: Build configuration
-        type: choice
-        options: [Release, Debug]
-        default: Release
+        options:
+          - x86-release
+          - x86-debug
+          - x64-release
+          - x64-debug
+          - x86
+          - x64
+          - release
+          - debug
+          - all
+        default: x86-release
       publish:
-        description: Publish the artifact as a release
+        description: Publish the artifacts as a release
         type: boolean
         default: false
 
 jobs:
+  # Turning the choice into a matrix needs a job of its own: workflow_dispatch
+  # inputs cannot be expanded into `strategy.matrix` directly. It also validates
+  # the tag before anything spends a runner on a multi-GB sync.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.pick.outputs.include }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          v='${{ inputs.version }}'
+          if [[ ! $v =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            echo "::error::'$v' is not a V8 tag (expected e.g. 14.8.180)"
+            exit 1
+          fi
+          major=${BASH_REMATCH[1]}
+          minor=${BASH_REMATCH[2]}
+
+          case '${{ inputs.configurations }}' in
+            all)         want="x86-Release x86-Debug x64-Release x64-Debug" ;;
+            x86)         want="x86-Release x86-Debug" ;;
+            x64)         want="x64-Release x64-Debug" ;;
+            release)     want="x86-Release x64-Release" ;;
+            debug)       want="x86-Debug x64-Debug" ;;
+            x86-release) want="x86-Release" ;;
+            x86-debug)   want="x86-Debug" ;;
+            x64-release) want="x64-Release" ;;
+            x64-debug)   want="x64-Debug" ;;
+          esac
+
+          # 32-bit cannot be built past 14.8.x: ExtendedMap, which landed during
+          # 14.9, breaks the Torque/C++ layout agreement under the MSVC ABI.
+          # Drop those entries rather than letting the job fail mid-build, so a
+          # mixed selection still produces its 64-bit half.
+          x86ok=yes
+          if (( major > 14 || (major == 14 && minor >= 9) )); then x86ok=no; fi
+
+          include=
+          for w in $want; do
+            arch=${w%-*}
+            config=${w#*-}
+            if [[ $arch == x86 && $x86ok == no ]]; then
+              echo "::warning::skipping $w - V8 $v cannot be built for x86 (see README)"
+              continue
+            fi
+            include="$include{\"arch\":\"$arch\",\"config\":\"$config\"},"
+          done
+          include="[${include%,}]"
+
+          if [[ $include == '[]' ]]; then
+            echo "::error::nothing left to build: '${{ inputs.configurations }}' selects 32-bit only, and V8 $v cannot be built for x86."
+            exit 1
+          fi
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+          echo "building: $include"
+
   build:
+    needs: plan
     runs-on: windows-latest
     # A cold x86 Release run - bootstrap, sync, compile, verify - is ~11 minutes
     # on 32 cores, of which 7 is ninja. A hosted runner has 4 cores, so budget
     # an hour or two. Generous rather than tight: a timeout loses the whole run,
     # and GitHub's hard ceiling is 360 anyway.
     timeout-minutes: 240
+    strategy:
+      # Each configuration is independent and expensive; one failing should not
+      # throw away the others' hours of work.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
 
     steps:
       - uses: actions/checkout@v4
-
-      # 32-bit cannot be built past 14.8.x: the ExtendedMap change during 14.9
-      # breaks Torque/MSVC-ABI layout agreement. Fail here rather than after a
-      # multi-GB sync.
-      - name: Check the version is buildable
-        shell: pwsh
-        run: |
-          $v = '${{ inputs.version }}'
-          if ($v -notmatch '^(\d+)\.(\d+)\.\d+$') { throw "'$v' is not a V8 tag (expected e.g. 14.8.180)" }
-          $major = [int]$Matches[1]; $minor = [int]$Matches[2]
-          if ('${{ inputs.arch }}' -eq 'x86' -and ($major -gt 14 -or ($major -eq 14 -and $minor -ge 9))) {
-            throw "V8 $v cannot be built for x86. ExtendedMap (landed during 14.9) breaks the Torque/C++ layout agreement under the MSVC ABI. Use 14.8.180 or older."
-          }
-          "$v / ${{ inputs.arch }} is a supported combination"
 
       - name: Report free disk
         shell: pwsh
@@ -65,14 +119,14 @@ jobs:
           .\build-v8.ps1 `
             -Root C:\v8b `
             -Version ${{ inputs.version }} `
-            -Arch ${{ inputs.arch }} `
-            -Config ${{ inputs.config }} `
+            -Arch ${{ matrix.arch }} `
+            -Config ${{ matrix.config }} `
             -Verify
 
       - name: Zip the distribution
         shell: pwsh
         run: |
-          $tag  = "${{ inputs.arch }}-$("${{ inputs.config }}".ToLower())"
+          $tag  = "${{ matrix.arch }}-$("${{ matrix.config }}".ToLower())"
           $name = "v8-${{ inputs.version }}-$tag"
           $dist = "C:\v8b\dist-$tag"
           if (-not (Test-Path "$dist\v8_monolith.lib")) { throw "no library at $dist" }
@@ -83,7 +137,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: v8-${{ inputs.version }}-${{ inputs.arch }}-${{ inputs.config }}
+          name: v8-${{ inputs.version }}-${{ matrix.arch }}-${{ matrix.config }}
           path: v8-*.zip
           retention-days: 7
           compression-level: 0   # already a zip
@@ -92,13 +146,15 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ inputs.arch }}-${{ inputs.config }}
+          name: logs-${{ matrix.arch }}-${{ matrix.config }}
           path: C:\v8b\build-*.log
           retention-days: 7
           if-no-files-found: ignore
 
   publish:
     needs: build
+    # Every configuration has to be green: a release that is missing half its
+    # matrix is worse than no release.
     if: inputs.publish
     runs-on: ubuntu-latest
     permissions:
@@ -108,6 +164,8 @@ jobs:
         with:
           pattern: v8-*
           merge-multiple: true
+      # Each zip is well under the 2 GiB per-asset limit; a combined archive
+      # would not be, so they are published separately.
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}

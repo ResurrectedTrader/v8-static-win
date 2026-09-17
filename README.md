@@ -8,6 +8,9 @@ Build V8 on Windows as a **monolithic static library** linked against the
 .\build-v8.ps1 -Root C:\v8b -Version 14.8.180 -Arch x86 -Config Release -Verify
 ```
 
+`-Arch` and `-Config` each also take `both`, building up to four configurations
+in sequence into one root, sharing the checkout.
+
 Output per configuration, under `dist-<arch>-<config>\`:
 
 | File | Purpose |
@@ -211,6 +214,20 @@ CRT-directive check alone never catches that.
 `.github/workflows/build.yml` is `workflow_dispatch` only. The output changes
 only when the pinned V8 version does, so consumers download published assets
 rather than building.
+
+It takes a **version** and a **configurations** choice — one cell
+(`x86-release`), a row or column (`x86`, `x64`, `release`, `debug`), or `all`.
+A `plan` job expands that into a `strategy.matrix`, which cannot be done from a
+`workflow_dispatch` input directly. Each configuration then gets its own runner:
+`fail-fast: false`, because they are independent and an hour of work each.
+
+Building them in one job instead is not an option — four in sequence would run
+past GitHub's 360-minute job ceiling.
+
+`plan` also validates the tag before a runner spends anything on a sync, and
+**drops** the 32-bit cells when the version is past 14.8.x rather than letting
+them fail mid-build, so `all` on a 15.x tag still builds its 64-bit half. If the
+selection leaves nothing, it fails there with that as the reason.
 
 Neither disk nor time is especially tight. A cold x86 Release run measures
 **9.3 GB** all in against the ~33 GB free on a hosted runner, and **~11 minutes**
