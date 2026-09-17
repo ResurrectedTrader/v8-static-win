@@ -1,0 +1,122 @@
+name: Build V8
+
+# Manual: the output only changes when the pinned V8 version does, and a sync
+# alone pulls ~11 GB. Consumers download the published assets.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: V8 tag (32-bit is capped at 14.8.x - see README)
+        type: string
+        required: true
+        default: 14.8.180
+      arch:
+        description: Target architecture
+        type: choice
+        options: [x86, x64]
+        default: x86
+      config:
+        description: Build configuration
+        type: choice
+        options: [Release, Debug]
+        default: Release
+      publish:
+        description: Publish the artifact as a release
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 32-bit cannot be built past 14.8.x: the ExtendedMap change during 14.9
+      # breaks Torque/MSVC-ABI layout agreement. Fail here rather than after a
+      # multi-GB sync.
+      - name: Check the version is buildable
+        shell: pwsh
+        run: |
+          $v = '${{ inputs.version }}'
+          if ($v -notmatch '^(\d+)\.(\d+)\.\d+$') { throw "'$v' is not a V8 tag (expected e.g. 14.8.180)" }
+          $major = [int]$Matches[1]; $minor = [int]$Matches[2]
+          if ('${{ inputs.arch }}' -eq 'x86' -and ($major -gt 14 -or ($major -eq 14 -and $minor -ge 9))) {
+            throw "V8 $v cannot be built for x86. ExtendedMap (landed during 14.9) breaks the Torque/C++ layout agreement under the MSVC ABI. Use 14.8.180 or older."
+          }
+          "$v / ${{ inputs.arch }} is a supported combination"
+
+      - name: Report free disk
+        shell: pwsh
+        run: Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+
+      # The build root is outside the workspace; depot_tools and the V8 checkout
+      # are large and unrelated to the repo contents.
+      - name: Build
+        shell: pwsh
+        run: |
+          .\build-v8.ps1 `
+            -Root C:\v8b `
+            -Version ${{ inputs.version }} `
+            -Arch ${{ inputs.arch }} `
+            -Config ${{ inputs.config }}
+
+      - name: Zip the distribution
+        shell: pwsh
+        run: |
+          $tag  = "${{ inputs.arch }}-$("${{ inputs.config }}".ToLower())"
+          $name = "v8-${{ inputs.version }}-$tag"
+          $dist = "C:\v8b\dist-$tag"
+          if (-not (Test-Path "$dist\v8_monolith.lib")) { throw "no library at $dist" }
+          Compress-Archive -Path "$dist\*" -DestinationPath "$env:GITHUB_WORKSPACE\$name.zip" -CompressionLevel Optimal
+          "{0} {1:N0} MB" -f "$name.zip", ((Get-Item "$env:GITHUB_WORKSPACE\$name.zip").Length/1MB)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-${{ inputs.version }}-${{ inputs.arch }}-${{ inputs.config }}
+          path: v8-*.zip
+          retention-days: 7
+          compression-level: 0   # already a zip
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ inputs.arch }}-${{ inputs.config }}
+          path: C:\v8b\build-*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  publish:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v8-*
+          merge-multiple: true
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la *.zip
+          tag="v8-${{ inputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber *.zip
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "V8 ${{ inputs.version }}" \
+              --notes "Monolithic V8 static libraries built against the static CRT (\`/MT\`).
+
+          Each archive contains \`v8_monolith.lib\`, \`include/\` and a \`README.txt\`.
+          Link \`winmm.lib dbghelp.lib advapi32.lib shlwapi.lib\` alongside it, and match
+          the CRT: \`/MT\` for Release, \`/MTd\` for Debug.
+
+          Note 32-bit builds are capped at V8 14.8.x - see the repository README." \
+              *.zip
+          fi
