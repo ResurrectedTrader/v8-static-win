@@ -24,6 +24,16 @@ on:
           - debug
           - all
         default: x86-release
+      runner:
+        # A library is only linkable by a toolchain at least as new as the one
+        # that built it: MSVC's STL headers call helpers that live in its own
+        # libcpmt.lib, so a consumer on an older Visual Studio gets undefined
+        # symbols (__std_max_element_* and friends). Building on the older image
+        # keeps the artifacts usable by both.
+        description: Runner image - windows-2022 (VS 2022) builds artifacts that link on more machines
+        type: choice
+        options: [windows-2022, windows-latest]
+        default: windows-2022
       publish:
         description: Publish the artifacts as a release
         type: boolean
@@ -69,7 +79,7 @@ jobs:
 
   build:
     needs: plan
-    runs-on: windows-latest
+    runs-on: ${{ inputs.runner }}
     # A cold x86 Release run - bootstrap, sync, compile, verify - is ~11 minutes
     # on 32 cores, of which 7 is ninja. A hosted runner has 4 cores, so budget
     # an hour or two. Generous rather than tight: a timeout loses the whole run,
@@ -99,24 +109,34 @@ jobs:
             -Config ${{ matrix.config }} `
             -Verify
 
+      # The MSVC toolset goes in the name: it is what decides whether a consumer
+      # can link the archive at all, and it is not recoverable from the contents
+      # at a glance. The build wrote it to toolset.txt, so the two cannot drift.
       - name: Zip the distribution
+        id: zip
         shell: pwsh
         run: |
           $tag  = "${{ matrix.arch }}-$("${{ matrix.config }}".ToLower())"
-          $name = "v8-${{ inputs.version }}-$tag"
           $dist = "C:\v8b\dist-$tag"
           if (-not (Test-Path "$dist\v8_monolith.lib")) { throw "no library at $dist" }
           if (-not (Test-Path "$dist\include\v8-gn.h"))  { throw "no v8-gn.h at $dist" }
+          if (-not (Test-Path "$dist\toolset.txt"))      { throw "no toolset.txt at $dist" }
+          $msvc = (Get-Content "$dist\toolset.txt" -Raw).Trim()
+          $name = "v8-${{ inputs.version }}-$tag-msvc$msvc"
           Compress-Archive -Path "$dist\*" -DestinationPath "$env:GITHUB_WORKSPACE\$name.zip" -CompressionLevel Optimal
-          "{0} {1:N0} MB" -f "$name.zip", ((Get-Item "$env:GITHUB_WORKSPACE\$name.zip").Length/1MB)
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "{0} {1:N0} MB (needs MSVC {2} or newer)" -f "$name.zip", ((Get-Item "$env:GITHUB_WORKSPACE\$name.zip").Length/1MB), $msvc
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: v8-${{ inputs.version }}-${{ matrix.arch }}-${{ matrix.config }}
+          name: ${{ steps.zip.outputs.name }}
           path: v8-*.zip
           retention-days: 7
           compression-level: 0   # already a zip
+          # Re-running a build for a version already built replaces its artifact
+          # rather than failing on the name.
+          overwrite: true
 
       - name: Upload logs on failure
         if: failure()
@@ -126,6 +146,7 @@ jobs:
           path: C:\v8b\build-*.log
           retention-days: 7
           if-no-files-found: ignore
+          overwrite: true
 
   publish:
     needs: build
@@ -142,31 +163,46 @@ jobs:
           merge-multiple: true
       # Each zip is well under the 2 GiB per-asset limit; a combined archive
       # would not be, so they are published separately.
+      # Re-running for a version that already has a release replaces its assets
+      # and its notes, rather than failing or leaving a half-updated release.
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -la *.zip
           tag="v8-${{ inputs.version }}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber *.zip
-          else
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
-              --title "V8 ${{ inputs.version }}" \
-              --notes "Monolithic V8 static libraries built against the static CRT (\`/MT\`).
 
-          Each archive contains \`v8_monolith.lib\`, \`include/\` and a \`README.txt\`.
-          Compile with \`/DV8_GN_HEADER\` so the public headers pick up the bundled
-          \`include/v8-gn.h\` and lay objects out the way the library does. Link
-          the system libraries listed in each archive's \`README.txt\` alongside it
-          (they include \`ntdll\`, \`userenv\` and \`bcrypt\`, which Rust's standard
-          library needs), and match the CRT: \`/MT\` for Release, \`/MTd\` for Debug.
-          A Debug library also needs \`/D_HAS_ITERATOR_DEBUGGING=0\`.
+          cat > notes.md <<'EOF'
+          Monolithic V8 static libraries built against the static CRT (`/MT`).
 
-          Temporal is built in; enable it at runtime with \`--harmony-temporal\`.
+          Each archive contains `v8_monolith.lib`, `include/` and a `README.txt`.
+          Compile with `/DV8_GN_HEADER` so the public headers pick up the bundled
+          `include/v8-gn.h` and lay objects out the way the library does. Link the
+          system libraries listed in each archive's `README.txt` alongside it (they
+          include `ntdll`, `userenv` and `bcrypt`, which Rust's standard library
+          needs), and match the CRT: `/MT` for Release, `/MTd` for Debug. Debug
+          keeps MSVC's checked iterators, so it needs no extra defines.
+
+          Temporal is built in; enable it at runtime with `--harmony-temporal`.
 
           Each configuration was verified by linking a DLL against it, confirming zero
           dynamic-CRT imports, and evaluating both plain JavaScript and a Temporal
-          computation through it." \
-              *.zip
+          computation through it.
+          EOF
+          cat >> notes.md <<'EOF'
+
+          The `msvc<x.y>` in each filename is the MSVC toolset the library was built
+          with, and it is a **floor, not a match**: link it with that toolset or any
+          newer one. An older toolset fails with undefined `__std_*` symbols, because
+          MSVC's STL headers call helpers that ship in its own `libcpmt.lib` and each
+          release only adds to that set.
+          EOF
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "V8 ${{ inputs.version }}" --notes-file notes.md
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber *.zip
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "V8 ${{ inputs.version }}" --notes-file notes.md *.zip
           fi

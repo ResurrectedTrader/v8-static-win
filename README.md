@@ -17,7 +17,8 @@ Output per configuration, under `dist-<arch>-<config>\`:
 |---|---|
 | `v8_monolith.lib` | the engine, one archive |
 | `include\` | V8's public headers, plus the generated `v8-gn.h` |
-| `README.txt` | the defines, CRT and system libs a consumer needs |
+| `README.txt` | the defines, CRT, system libs and toolset a consumer needs |
+| `toolset.txt` | the MSVC toolset it was built with, machine-readable |
 
 `v8_monolithic = true` emits a self-contained archive of V8's own objects.
 Temporal is Rust, which that does **not** cover, so its archives are folded in
@@ -29,9 +30,8 @@ passes it. `-Temporal:$false` builds without Temporal.
 
 ## Consuming the result
 
-Compile with **`/DV8_GN_HEADER`** and `include\` on the include path. Against a
-**Debug** library, add **`/D_HAS_ITERATOR_DEBUGGING=0`**. Nothing else is
-required.
+Compile with **`/DV8_GN_HEADER`** and `include\` on the include path. Nothing
+else is required, in either configuration.
 
 That one define is load-bearing. V8's public headers are configured by macros
 the GN build passes on the command line, and an embedder that does not repeat
@@ -60,12 +60,13 @@ rather than at runtime.
 sandbox against the library and aborts on a mismatch — but that covers only
 those three.
 
-### Why Debug needs `_HAS_ITERATOR_DEBUGGING=0`
+### Debug keeps checked iterators
 
-Not a preference — Debug does not compile without it. MSVC's checked iterators
-put a `_DEBUG_LT_PRED` on every comparison, and V8 sorts its 864-entry flag
-table in a `consteval` function (`src/flags/flags.cc`), so the sort overruns
-clang's constexpr budget:
+A Debug library is only useful if it links against Debug code built the ordinary
+way, so this one keeps MSVC's `_ITERATOR_DEBUG_LEVEL=2`. Getting there took a
+patch, because V8 sorts its ~864-entry flag table in a `constexpr` initialiser
+and MSVC's `std::sort` adds a predicate-ordering check to every comparison when
+checked iterators are on:
 
 ```
 error: constexpr variable 'sorted_indices' must be initialized by a constant expression
@@ -73,11 +74,14 @@ note: constexpr evaluation hit maximum step limit; possible infinite loop?
       for (_BidIt _Prev = _Hole; _DEBUG_LT_PRED(_Pred, _Val, *--_Prev); ...)
 ```
 
-Raising `-fconstexpr-steps` does not help; only turning the checked iterators
-off does. So the Debug library carries `_ITERATOR_DEBUG_LEVEL=0` and a consumer
-has to match. A mismatch is a linker error naming the symbol, not silent
-corruption — and `-Verify` compiles its spike the same way, so the requirement
-is exercised rather than merely documented.
+Raising `-fconstexpr-steps` does not rescue it — 100,000,000 still fails, with
+the flag verifiably on the command line. Replacing that one `std::sort` with a
+hand-rolled heapsort does: same result, O(n log n) comparisons instead of
+`std::sort`'s introsort plus the debug predicate, comfortably inside the budget.
+
+Turning the checked iterators off would have been the smaller patch, but it sets
+`_ITERATOR_DEBUG_LEVEL=0` for the whole binary — every other static library a
+consumer links would have to be rebuilt to match, or the linker rejects it.
 
 ## Version support
 
@@ -152,6 +156,7 @@ are handled without editing this list.
 | `src/objects/map.tq` | declare the same padding | so Torque's `kSize` matches `sizeof` |
 | `src/objects/js-interceptor-map.h` | `extended_padding_[kTaggedSize - 2]` → `[- 1]` | `ExtendedMap` no longer donates a byte, so its one subclass pads a byte further |
 | `src/objects/js-interceptor-map.tq` | `extended_padding[2]`→`[3]`, `[6]`→`[7]` | the same, for both tagged-pointer sizes |
+| `src/flags/flags.cc` | that one `std::sort` → a hand-rolled heapsort | lets Debug keep checked iterators — see above |
 
 ## Temporal
 
@@ -211,6 +216,18 @@ depot_tools is fetched into `-Root` by the script.
   `python3_bin_reldir.txt not found. need to initialize depot_tools by running
   gclient or update_depot_tools`. The script runs `bootstrap\win_tools.bat`
   directly once, before setting the variable.
+* **A library is only linkable by a toolchain at least as new as the one that
+  built it.** MSVC's STL headers call helpers that live in its own
+  `libcpmt.lib`, so a consumer on an older Visual Studio gets undefined symbols
+  with no hint of the cause:
+
+  ```
+  lld-link: error: undefined symbol: ___std_max_element_8i@8
+  ```
+
+  This is why the workflow defaults to the **older** runner image. It is also
+  the reason `use_custom_libcxx = false` is not the whole story: matching MSVC's
+  STL is necessary, but a compatible *version* of it is what actually links.
 * **An existing depot_tools on `PATH` hijacks a second one.** `gclient.bat`
   *appends* its own directory to `PATH` and then calls `vpython3` unqualified,
   so a system-wide install runs this checkout's scripts under its interpreter —
@@ -237,7 +254,7 @@ use_custom_libcxx = false       # MSVC's STL, not the bundled libc++
 v8_generate_external_defines_header = true   # emits include/v8-gn.h
 v8_enable_pointer_compression   # true on x64, unsupported on x86
 v8_enable_sandbox = false       # unavailable here - see below
-enable_iterator_debugging = false   # Debug does not compile otherwise
+enable_iterator_debugging           # true in Debug, as MSVC defaults it
 v8_enable_i18n_support = false
 v8_enable_webassembly = false
 v8_enable_temporal_support = true   # needs the Rust merge - see below
@@ -290,9 +307,9 @@ CRT-directive check alone never catches that. The Temporal expression earns its
 place separately: those symbols come from archives merged in after the fact, and
 linking proves only that they exist, not that they run.
 
-The Debug configurations also compile the embedder with
-`/D_HAS_ITERATOR_DEBUGGING=0`, so the requirement that imposes on consumers is
-exercised on every build rather than merely written down here.
+The spike sets no `_HAS_ITERATOR_DEBUGGING` of its own, so it is compiled the
+way a consumer's code would be — a library built at a different
+`_ITERATOR_DEBUG_LEVEL` fails this link rather than theirs.
 
 ## Continuous integration
 
@@ -300,8 +317,9 @@ exercised on every build rather than merely written down here.
 only when the pinned V8 version does, so consumers download published assets
 rather than building.
 
-It takes a **version** and a **configurations** choice — one cell
-(`x86-release`), a row or column (`x86`, `x64`, `release`, `debug`), or `all`.
+It takes a **version**, a **configurations** choice — one cell
+(`x86-release`), a row or column (`x86`, `x64`, `release`, `debug`), or `all` —
+and a **runner**.
 A `plan` job expands that into a `strategy.matrix`, which cannot be done from a
 `workflow_dispatch` input directly. Each configuration then gets its own runner:
 `fail-fast: false`, because they are independent and an hour of work each.
@@ -311,6 +329,27 @@ past GitHub's 360-minute job ceiling.
 
 `plan` also validates the tag before a runner spends anything on a multi-gigabyte
 sync.
+
+Published archives carry the toolset in the name —
+`v8-15.6.8-x86-release-msvc14.44.zip` — so which one you can use is visible
+before downloading a gigabyte. The name comes from the `toolset.txt` the build
+writes, so it cannot drift from what actually compiled the library.
+
+That version is a **floor, not a match**: 14.44 links on 14.44, 14.50 and newer.
+Each MSVC release only adds `__std_*` helpers and never drops one — 14.29 defines
+125, 14.44 defines 231, 14.50 defines 280 — so building low and consuming high
+always works, and the reverse never does.
+
+**The runner choice decides who can link the result.** It defaults to
+`windows-2022` (Visual Studio 2022) rather than `windows-latest`, which is now
+Visual Studio 2026: an artifact built there needs a consumer on a Visual Studio
+at least as new, or the link fails on missing STL helpers. Building on the older
+image costs nothing and widens who can use the output. `windows-latest` stays
+selectable for when that stops being true.
+
+**Re-running for a version already built replaces it.** Artifacts upload with
+`overwrite: true`, and publishing edits the existing release's notes and
+re-uploads its assets with `--clobber` instead of failing on the tag.
 
 Neither disk nor time is especially tight. One x86 Release configuration
 measures ~12 GB against the ~33 GB free on a hosted runner, and ~11 minutes on

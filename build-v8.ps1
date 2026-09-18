@@ -265,6 +265,26 @@ function Invoke-SourcePatches {
             Old  = '  @if(TAGGED_SIZE_8_BYTES) extended_padding[6]: uint8;'
             New  = '  @if(TAGGED_SIZE_8_BYTES) extended_padding[7]: uint8;'
             Why  = 'matches the widened padding in js-interceptor-map.h (8-byte tagged)'
+        },
+
+        # V8 sorts its flag table (~864 entries) in a constexpr initialiser. With
+        # iterator debugging on, MSVC's std::sort adds a predicate-ordering check
+        # to every comparison and the initialiser overruns clang's constexpr
+        # budget - raising -fconstexpr-steps does not rescue it. A hand-rolled
+        # heapsort keeps the same result at a fraction of the steps, which is
+        # what lets Debug keep _ITERATOR_DEBUG_LEVEL at its default. The two
+        # entries differ only in how the version spells the comparison.
+        @{
+            File = 'src/flags/flags.cc'
+            Old  = "  std::sort(indices.begin(), indices.end(), [](int i, int j) {`n    return FlagHelpers::FlagNamesCmp(kFlagsMetadata[i].name,`n                                     kFlagsMetadata[j].name) < 0;`n  });"
+            New  = "  auto less = [](int i, int j) {`n    return FlagHelpers::FlagNamesCmp(kFlagsMetadata[i].name,`n                                     kFlagsMetadata[j].name) < 0;`n  };`n  auto sift = [&](size_t root, size_t count) {`n    for (size_t child = (2 * root) + 1; child < count; child = (2 * root) + 1) {`n      if (child + 1 < count && less(indices[child], indices[child + 1])) ++child;`n      if (!less(indices[root], indices[child])) return;`n      const int tmp = indices[root];`n      indices[root] = indices[child];`n      indices[child] = tmp;`n      root = child;`n    }`n  };`n  for (size_t i = kNumAllFlags / 2; i-- > 0;) sift(i, kNumAllFlags);`n  for (size_t end = kNumAllFlags; end-- > 1;) {`n    const int tmp = indices[0];`n    indices[0] = indices[end];`n    indices[end] = tmp;`n    sift(0, end);`n  }"
+            Why  = 'sorts the flag table within the constexpr budget, so Debug keeps checked iterators'
+        },
+        @{
+            File = 'src/flags/flags.cc'
+            Old  = "  std::sort(indices.begin(), indices.end(), [&](int i, int j) {`n    return FlagHelpers::FlagNamesCmp(kFlagNames[i], kFlagNames[j]) < 0;`n  });"
+            New  = "  auto less = [&](int i, int j) {`n    return FlagHelpers::FlagNamesCmp(kFlagNames[i], kFlagNames[j]) < 0;`n  };`n  auto sift = [&](size_t root, size_t count) {`n    for (size_t child = (2 * root) + 1; child < count; child = (2 * root) + 1) {`n      if (child + 1 < count && less(indices[child], indices[child + 1])) ++child;`n      if (!less(indices[root], indices[child])) return;`n      const int tmp = indices[root];`n      indices[root] = indices[child];`n      indices[child] = tmp;`n      root = child;`n    }`n  };`n  for (size_t i = kNumFlags / 2; i-- > 0;) sift(i, kNumFlags);`n  for (size_t end = kNumFlags; end-- > 1;) {`n    const int tmp = indices[0];`n    indices[0] = indices[end];`n    indices[end] = tmp;`n    sift(0, end);`n  }"
+            Why  = 'the same, for versions that index a flat kFlagNames table'
         }
     )
 
@@ -314,6 +334,33 @@ function Get-WindowsSdk {
             if ($value -gt $bestValue) { $bestValue = $value; $best = $g[1].Value }
         }
     [pscustomobject]@{ Root = $root; Version = $ver.Name; Ntddi = $best }
+}
+
+# The MSVC toolset the build will use, which is the one thing a consumer has to
+# match: its STL headers call helpers that live in its own libcpmt.lib, so
+# linking against this library needs that toolset or newer. Identified by
+# toolset version rather than by Visual Studio year, because the two do not
+# correspond - 14.44 ships under both 2022 and 2026.
+function Get-MsvcToolset {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) { return $null }
+
+    Invoke-Native { $script:vsPath = @(& $vswhere -latest -property installationPath 2>&1) } 'vswhere' -AllowFailure
+    Invoke-Native { $script:vsName = @(& $vswhere -latest -property displayName 2>&1) } 'vswhere' -AllowFailure
+    $root = $script:vsPath | Where-Object { $_ } | Select-Object -First 1
+    if (-not $root) { return $null }
+
+    # V8's own toolchain resolution picks the newest toolset, so match that.
+    $toolset = Get-ChildItem (Join-Path $root 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue |
+               Sort-Object { [version]$_.Name } | Select-Object -Last 1
+    if (-not $toolset) { return $null }
+
+    $parts = $toolset.Name.Split('.')
+    [pscustomobject]@{
+        Version = $toolset.Name
+        Short   = "$($parts[0]).$($parts[1])"
+        Display = ($script:vsName | Where-Object { $_ } | Select-Object -First 1)
+    }
 }
 
 # V8 15.x pins a Windows SDK version and an NTDDI symbol that ships with it. On
@@ -409,14 +456,11 @@ v8_enable_sandbox = false
 v8_enable_backtrace = $(if ($Config -eq 'Debug') { 'true' } else { 'false' })
 v8_enable_slow_dchecks = $(if ($Config -eq 'Debug') { 'true' } else { 'false' })
 v8_optimized_debug = $(if ($Config -eq 'Debug') { 'true' } else { 'false' })
-# Off even in Debug, where it would otherwise be the natural choice: it leaves
-# _HAS_ITERATOR_DEBUGGING at the MSVC default, and the resulting _DEBUG_LT_PRED
-# on every comparison makes V8's consteval flag-table sort (864 entries, in
-# src/flags/flags.cc) exceed clang's constexpr budget, so Debug does not compile
-# at all. Raising -fconstexpr-steps does not help. The cost is that a Debug
-# consumer must also define _HAS_ITERATOR_DEBUGGING=0; the linker catches a
-# mismatch rather than letting it corrupt silently.
-enable_iterator_debugging = false
+# Left at the MSVC default, so a Debug library matches what everything else in a
+# Debug build is compiled with and needs no _HAS_ITERATOR_DEBUGGING on the
+# consumer side. The flag-table sort that this would otherwise break is patched
+# in Invoke-SourcePatches.
+enable_iterator_debugging = $(if ($Config -eq 'Debug') { 'true' } else { 'false' })
 
 v8_enable_i18n_support = false
 v8_enable_webassembly = false
@@ -523,16 +567,15 @@ function Invoke-Build {
     Copy-Item $gnHeader (Join-Path $dist 'include')
 
     $crt = if ($Config -eq 'Debug') { '/MTd (libcmtd)' } else { '/MT (libcmt)' }
-    $defines = if ($Config -eq 'Debug') { '/DV8_GN_HEADER /D_HAS_ITERATOR_DEBUGGING=0' }
-               else                     { '/DV8_GN_HEADER' }
+    $defines = '/DV8_GN_HEADER'
+    $toolset = Get-MsvcToolset
+    $builtWith = if ($toolset) { "$($toolset.Version)  ($($toolset.Display))" } else { 'unknown' }
     $idl = if ($Config -ne 'Debug') { '' } else { @'
 
-_HAS_ITERATOR_DEBUGGING=0 is not optional for this Debug library. MSVC's checked
-iterators put a _DEBUG_LT_PRED on every comparison, which makes V8's consteval
-flag-table sort overrun clang's constexpr budget, so the engine cannot be built
-in Debug with them on. The library therefore carries _ITERATOR_DEBUG_LEVEL=0 and
-a consumer must match it. A mismatch is a linker error naming the symbol, not a
-silent corruption.
+This Debug library keeps MSVC's checked iterators (_ITERATOR_DEBUG_LEVEL=2, the
+default), so it links against Debug code built the ordinary way - no
+_HAS_ITERATOR_DEBUGGING on the consumer side, and no rebuild of any other static
+library to match.
 '@ }
     @"
 V8 $Version ($Arch $Config), static CRT.
@@ -541,9 +584,15 @@ V8 $Version ($Arch $Config), static CRT.
   include path : include
   compile with : $defines
   CRT          : $crt - must match the consuming project
+  built with   : MSVC $builtWith
   system libs  : winmm.lib dbghelp.lib advapi32.lib shlwapi.lib ws2_32.lib
                  user32.lib kernel32.lib ole32.lib oleaut32.lib psapi.lib
                  version.lib ntdll.lib userenv.lib bcrypt.lib
+
+Link this with MSVC $($toolset.Short) or newer. An older toolset fails with
+undefined __std_* symbols: the STL headers this was compiled against call
+helpers that ship in that toolset's own libcpmt.lib. Note the toolset version is
+what matters, not the Visual Studio year - 14.44 ships under both 2022 and 2026.
 $idl
 V8_GN_HEADER makes v8config.h pull in the bundled include/v8-gn.h, which carries
 the exact define set this library was built with. Without it the public headers
@@ -562,7 +611,12 @@ that has to interoperate with MSVC's STL. i18n and WebAssembly are disabled.
 Temporal is built in - its Rust archives are part of this .lib, so nothing extra
 needs linking - but it stays behind a runtime flag: pass --harmony-temporal.
 "@ | Set-Content -Encoding ascii (Join-Path $dist 'README.txt')
-    Ok "dist: $dist"
+
+    # Machine-readable counterpart to the "built with" line above, so packaging
+    # can label an archive with the toolset it needs without re-deriving it.
+    if ($toolset) { $toolset.Short | Set-Content -Encoding ascii (Join-Path $dist 'toolset.txt') }
+
+    Ok "dist: $dist$(if ($toolset) { " (MSVC $($toolset.Short))" })"
     return $dist
 }
 
@@ -694,11 +748,10 @@ extern "C" __declspec(dllexport) int SpikeRun() {
                     $(if ($Config -eq 'Debug') { '/MTd' } else { '/MT' }),
                     '/DV8_GN_HEADER', '/DWIN32', '/D_WINDOWS', '/DNOMINMAX',
                     "/DEXPECT_TEMPORAL=$(if ($Temporal) { 1 } else { 0 })",
-                    # Matches enable_iterator_debugging=false in the build args.
-                    # Without it the link fails on MSVC's _ITERATOR_DEBUG_LEVEL
-                    # detect_mismatch - which is exactly the check a consumer
-                    # gets, so leaving it out here would hide the requirement.
-                    '/D_HAS_ITERATOR_DEBUGGING=0',
+                    # Nothing sets _HAS_ITERATOR_DEBUGGING here on purpose: the
+                    # spike is compiled the way a consumer's own code would be,
+                    # so a library built with a different _ITERATOR_DEBUG_LEVEL
+                    # fails this link rather than theirs.
                     "/I$Dist\include", 'verify.cpp', '/Foverify.obj')
         Invoke-Native {
             & "$llvm\clang-cl.exe" @cargs 2>&1 | Where-Object { $_ -match 'error' }
