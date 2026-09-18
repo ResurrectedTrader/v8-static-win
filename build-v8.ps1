@@ -201,7 +201,7 @@ solutions = [
             $attempt++
             Invoke-Native {
                 & (Join-Path $DepotTools 'gclient.bat') sync -D --no-history --shallow 2>&1 |
-                    Tee-Object -FilePath $syncLog
+                    Tee-Object -FilePath $syncLog | Out-Host
             } 'gclient sync' -AllowFailure
             if ($LASTEXITCODE -eq 0) { break }
             if ($attempt -ge 3) {
@@ -529,7 +529,7 @@ function Add-RustArchives {
     $items | Set-Content -Encoding ascii $rsp
 
     Invoke-Native {
-        & (Join-Path $llvm 'lld-link.exe') /lib "@$rsp" 2>&1 | Where-Object { $_ -match 'error' }
+        & (Join-Path $llvm 'lld-link.exe') /lib "@$rsp" 2>&1 | Where-Object { $_ -match 'error' } | Out-Host
     } 'folding the Rust archives into the monolith'
     if (-not (Test-Path $merged)) { Die "the Rust merge produced nothing at $merged" }
 
@@ -566,7 +566,7 @@ function Invoke-Build {
         # indistinguishable from one that has hung, and the log is only
         # collected after the job ends - too late to tell the difference.
         Invoke-Native {
-            & $ninja -C "out/$tag" v8_monolith 2>&1 | Tee-Object -FilePath $log
+            & $ninja -C "out/$tag" v8_monolith 2>&1 | Tee-Object -FilePath $log | Out-Host
         } "ninja ($tag)" -AllowFailure
         if ($LASTEXITCODE -ne 0) {
             Get-Content (Join-Path $Root "build-$tag.log") -Tail 20
@@ -781,7 +781,7 @@ extern "C" __declspec(dllexport) int SpikeRun() {
                     # fails this link rather than theirs.
                     "/I$Dist\include", 'verify.cpp', '/Foverify.obj')
         Invoke-Native {
-            & "$llvm\clang-cl.exe" @cargs 2>&1 | Where-Object { $_ -match 'error' }
+            & "$llvm\clang-cl.exe" @cargs 2>&1 | Where-Object { $_ -match 'error' } | Out-Host
         } 'verify compile' -AllowFailure
         if (-not (Test-Path 'verify.obj')) { Die "verify compile failed ($Arch $Config)" }
 
@@ -799,7 +799,7 @@ extern "C" __declspec(dllexport) int SpikeRun() {
         # command-line limit on some hosts.
         $largs | Set-Content -Encoding ascii 'verify.rsp'
         Invoke-Native {
-            & "$llvm\lld-link.exe" '@verify.rsp' 2>&1 | Where-Object { $_ -match 'error' }
+            & "$llvm\lld-link.exe" '@verify.rsp' 2>&1 | Where-Object { $_ -match 'error' } | Out-Host
         } 'verify link' -AllowFailure
         if (-not (Test-Path 'verify.dll')) { Die "verify link failed ($Arch $Config)" }
 
