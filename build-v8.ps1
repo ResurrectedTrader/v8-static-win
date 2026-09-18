@@ -97,7 +97,7 @@ function Initialize-DepotTools {
     if (-not (Test-Path (Join-Path $dt 'gclient.bat'))) {
         Info 'fetching depot_tools'
         Invoke-Native {
-            git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $dt 2>&1 | Out-Null
+            git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $dt 2>&1 | Write-Host
         } 'depot_tools clone'
     }
     # Mandatory for non-Googlers: otherwise it tries to fetch Google's internal
@@ -119,7 +119,7 @@ function Initialize-DepotTools {
     if (-not (Test-Path (Join-Path $dt 'python3_bin_reldir.txt'))) {
         Info 'bootstrapping depot_tools (downloads its bundled Python)'
         Invoke-Native {
-            & (Join-Path $dt 'bootstrap\win_tools.bat') 2>&1 | Out-Null
+            & (Join-Path $dt 'bootstrap\win_tools.bat') 2>&1 | Write-Host
         } 'depot_tools bootstrap'
         if (-not (Test-Path (Join-Path $dt 'python3_bin_reldir.txt'))) {
             Die 'depot_tools bootstrap produced no python3_bin_reldir.txt'
@@ -159,7 +159,7 @@ solutions = [
         Info "cloning v8 at $Version (shallow)"
         Invoke-Native {
             git clone --depth 1 --no-checkout --branch $Version `
-                https://chromium.googlesource.com/v8/v8.git $src 2>&1 | Out-Null
+                https://chromium.googlesource.com/v8/v8.git $src 2>&1 | Write-Host
         } 'v8 clone'
     }
 
@@ -200,7 +200,8 @@ solutions = [
         while ($true) {
             $attempt++
             Invoke-Native {
-                & (Join-Path $DepotTools 'gclient.bat') sync -D --no-history --shallow *> $syncLog
+                & (Join-Path $DepotTools 'gclient.bat') sync -D --no-history --shallow 2>&1 |
+                    Tee-Object -FilePath $syncLog
             } 'gclient sync' -AllowFailure
             if ($LASTEXITCODE -eq 0) { break }
             if ($attempt -ge 3) {
@@ -556,12 +557,17 @@ function Invoke-Build {
     Push-Location $Src
     try {
         Info "gn gen ($tag)"
-        Invoke-Native { & (Join-Path $DepotTools 'gn.bat') gen "out/$tag" 2>&1 | Out-Null } "gn gen ($tag)"
+        Invoke-Native { & (Join-Path $DepotTools 'gn.bat') gen "out/$tag" 2>&1 | Write-Host } "gn gen ($tag)"
 
         Info "building v8_monolith ($tag)"
         $log = Join-Path $Root "build-$tag.log"
         $ninja = Join-Path $DepotTools 'autoninja.bat'
-        Invoke-Native { & $ninja -C "out/$tag" v8_monolith *> $log } "ninja ($tag)" -AllowFailure
+        # Tee rather than redirect: a build that prints nothing for an hour is
+        # indistinguishable from one that has hung, and the log is only
+        # collected after the job ends - too late to tell the difference.
+        Invoke-Native {
+            & $ninja -C "out/$tag" v8_monolith 2>&1 | Tee-Object -FilePath $log
+        } "ninja ($tag)" -AllowFailure
         if ($LASTEXITCODE -ne 0) {
             Get-Content (Join-Path $Root "build-$tag.log") -Tail 20
             Die "build failed ($tag); see build-$tag.log"
