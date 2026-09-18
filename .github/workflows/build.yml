@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: V8 tag (32-bit is capped at 14.8.x - see README)
+        description: V8 tag, e.g. 15.6.8
         type: string
         required: true
-        default: 14.8.180
+        default: 15.6.8
       configurations:
         description: What to build
         type: choice
@@ -42,12 +42,10 @@ jobs:
         shell: bash
         run: |
           v='${{ inputs.version }}'
-          if [[ ! $v =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
-            echo "::error::'$v' is not a V8 tag (expected e.g. 14.8.180)"
+          if [[ ! $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$v' is not a V8 tag (expected e.g. 15.6.8)"
             exit 1
           fi
-          major=${BASH_REMATCH[1]}
-          minor=${BASH_REMATCH[2]}
 
           case '${{ inputs.configurations }}' in
             all)         want="x86-Release x86-Debug x64-Release x64-Debug" ;;
@@ -61,29 +59,11 @@ jobs:
             x64-debug)   want="x64-Debug" ;;
           esac
 
-          # 32-bit cannot be built past 14.8.x: ExtendedMap, which landed during
-          # 14.9, breaks the Torque/C++ layout agreement under the MSVC ABI.
-          # Drop those entries rather than letting the job fail mid-build, so a
-          # mixed selection still produces its 64-bit half.
-          x86ok=yes
-          if (( major > 14 || (major == 14 && minor >= 9) )); then x86ok=no; fi
-
           include=
           for w in $want; do
-            arch=${w%-*}
-            config=${w#*-}
-            if [[ $arch == x86 && $x86ok == no ]]; then
-              echo "::warning::skipping $w - V8 $v cannot be built for x86 (see README)"
-              continue
-            fi
-            include="$include{\"arch\":\"$arch\",\"config\":\"$config\"},"
+            include="$include{\"arch\":\"${w%-*}\",\"config\":\"${w#*-}\"},"
           done
           include="[${include%,}]"
-
-          if [[ $include == '[]' ]]; then
-            echo "::error::nothing left to build: '${{ inputs.configurations }}' selects 32-bit only, and V8 $v cannot be built for x86."
-            exit 1
-          fi
           echo "include=$include" >> "$GITHUB_OUTPUT"
           echo "building: $include"
 
@@ -104,10 +84,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Report free disk
-        shell: pwsh
-        run: Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
 
       # The build root is outside the workspace; depot_tools and the V8 checkout
       # are large and unrelated to the repo contents.
@@ -182,12 +158,15 @@ jobs:
           Each archive contains \`v8_monolith.lib\`, \`include/\` and a \`README.txt\`.
           Compile with \`/DV8_GN_HEADER\` so the public headers pick up the bundled
           \`include/v8-gn.h\` and lay objects out the way the library does. Link
-          \`winmm.lib dbghelp.lib advapi32.lib shlwapi.lib\` alongside it, and match
-          the CRT: \`/MT\` for Release, \`/MTd\` for Debug.
+          the system libraries listed in each archive's \`README.txt\` alongside it
+          (they include \`ntdll\`, \`userenv\` and \`bcrypt\`, which Rust's standard
+          library needs), and match the CRT: \`/MT\` for Release, \`/MTd\` for Debug.
+          A Debug library also needs \`/D_HAS_ITERATOR_DEBUGGING=0\`.
+
+          Temporal is built in; enable it at runtime with \`--harmony-temporal\`.
 
           Each configuration was verified by linking a DLL against it, confirming zero
-          dynamic-CRT imports, and evaluating JavaScript through it.
-
-          Note 32-bit builds are capped at V8 14.8.x - see the repository README." \
+          dynamic-CRT imports, and evaluating both plain JavaScript and a Temporal
+          computation through it." \
               *.zip
           fi

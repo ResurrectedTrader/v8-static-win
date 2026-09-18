@@ -5,7 +5,7 @@ Build V8 on Windows as a **monolithic static library** linked against the
 `vcruntime140.dll` / `msvcp140.dll` dependency.
 
 ```powershell
-.\build-v8.ps1 -Root C:\v8b -Version 14.8.180 -Arch x86 -Config Release -Verify
+.\build-v8.ps1 -Root C:\v8b -Version 15.6.8 -Arch x86 -Config Release -Verify
 ```
 
 `-Arch` and `-Config` each also take `both`, building up to four configurations
@@ -19,16 +19,19 @@ Output per configuration, under `dist-<arch>-<config>\`:
 | `include\` | V8's public headers, plus the generated `v8-gn.h` |
 | `README.txt` | the defines, CRT and system libs a consumer needs |
 
-Unlike SpiderMonkey, **no packaging step is needed** — `v8_monolithic = true`
-emits a genuine self-contained archive.
+`v8_monolithic = true` emits a self-contained archive of V8's own objects.
+Temporal is Rust, which that does **not** cover, so its archives are folded in
+afterwards — see [Temporal](#temporal). The result is still one `.lib`.
 
 `-Verify` compiles a small embedder against the result, links it into a DLL, and
-evaluates JavaScript through it. CI always passes it.
+evaluates both plain JavaScript and a Temporal computation through it. CI always
+passes it. `-Temporal:$false` builds without Temporal.
 
 ## Consuming the result
 
-Compile with **`/DV8_GN_HEADER`** and `include\` on the include path. Nothing
-else is required.
+Compile with **`/DV8_GN_HEADER`** and `include\` on the include path. Against a
+**Debug** library, add **`/D_HAS_ITERATOR_DEBUGGING=0`**. Nothing else is
+required.
 
 That one define is load-bearing. V8's public headers are configured by macros
 the GN build passes on the command line, and an embedder that does not repeat
@@ -57,65 +60,129 @@ rather than at runtime.
 sandbox against the library and aborts on a mismatch — but that covers only
 those three.
 
+### Why Debug needs `_HAS_ITERATOR_DEBUGGING=0`
+
+Not a preference — Debug does not compile without it. MSVC's checked iterators
+put a `_DEBUG_LT_PRED` on every comparison, and V8 sorts its 864-entry flag
+table in a `consteval` function (`src/flags/flags.cc`), so the sort overruns
+clang's constexpr budget:
+
+```
+error: constexpr variable 'sorted_indices' must be initialized by a constant expression
+note: constexpr evaluation hit maximum step limit; possible infinite loop?
+      for (_BidIt _Prev = _Hole; _DEBUG_LT_PRED(_Pred, _Val, *--_Prev); ...)
+```
+
+Raising `-fconstexpr-steps` does not help; only turning the checked iterators
+off does. So the Debug library carries `_ITERATOR_DEBUG_LEVEL=0` and a consumer
+has to match. A mismatch is a linker error naming the symbol, not silent
+corruption — and `-Verify` compiles its spike the same way, so the requirement
+is exercised rather than merely documented.
+
 ## Version support
 
-This is the part that matters most, because the version determines whether the
-build is possible at all.
+Both architectures build on current V8. Two things stand between a stock
+checkout and a working 32-bit library, and the script handles both:
 
-| V8 | 64-bit | 32-bit | Notes |
-|---|---|---|---|
-| ≤ 14.3.x | ✅ | ✅ | no patches needed |
-| 14.4 – 14.8.x | ✅ | ✅ | needs the two source patches below |
-| ≥ 14.9 | ✅ | ❌ | `ExtendedMap` breaks 32-bit (see below) |
-| ≥ 15.x | ✅ | ❌ | also hardcodes a Windows SDK most machines do not have |
+| V8 | Needs | Handled by |
+|---|---|---|
+| 14.4 onwards | MSVC's `std::function` rejects V8's callable trait | a one-line source patch |
+| 14.9 onwards | `ExtendedMap` assumes the Itanium ABI's packing rules | four small layout patches |
+| 15.x onwards | a Windows SDK pin most machines cannot satisfy | retargeting at the installed SDK |
 
-**Verified**: 14.8.180 x86 Release — 1,038 MB monolith, `libcmt`/`libcpmt`, zero
-dynamic-CRT imports in a DLL linked against it, and `40 + 2 === 42` evaluated
-through that DLL.
+Older releases need fewer of these; a patch whose text is absent is reported and
+skipped rather than failing, so the same script covers the range.
 
-### Why 32-bit stops at 14.8
+**Verified on 15.6.8**, the newest release at the time of writing, across all
+four configurations — each one linked into a DLL with zero dynamic-CRT imports
+and evaluated both plain JavaScript and a Temporal computation. 14.8.180 is
+verified the same way.
 
-On 2026-04-28, `067131a2` *"[maps] Support customizable map shapes"* (landed
-during 14.9) introduced `ExtendedMap` as a `V8_ABSTRACT_OBJECT` — `pack(1)`,
-deliberately no tail padding, with subclasses expected to occupy that space.
-Torque models the derived class's first field at `sizeof(ExtendedMap)`; under
-the MSVC ABI clang-cl places it elsewhere, so the generated assertions fail:
+### `ExtendedMap`, and why 32-bit used to stop at 14.8
+
+During 14.9, `ExtendedMap` arrived as a `V8_ABSTRACT_OBJECT` — `#pragma pack(1)`
+— ending in a `uint8_t` and carrying the comment *"Leaves kTaggedSize-1 unused
+bytes, they will be used by subclasses."* That only works where `pack(1)` also
+lowers the class's **alignment**, which the Itanium ABI does and the MSVC ABI
+does not. So `sizeof(ExtendedMap)` is `sizeof(Map) + 1` under one and rounds up
+to `sizeof(Map) + 4` under the other, and Torque's generated assertion fails:
 
 ```
-error: static assertion failed:
-  Value of JSInterceptorMap::kFlagsOffset defined in Torque and offset of
-  field JSInterceptorMap::flags in C++ do not match
+gen/torque-generated/src/objects/map-tq.cc(102): static assertion failed
+  static_assert(kSize == sizeof(ExtendedMap));
+  note: expression evaluates to '41 == 44'
 ```
 
-`14.8.180` is the newest release before that change. Fixing it upstream looks
-tractable — the trigger commit is known and the failure is deterministic — but
-it has not been attempted here.
+The fix is to stop relying on the trick: name those bytes as a padding field in
+both `map.h` and `map.tq`, and shrink the one subclass's own padding to match.
+The layout then comes out the same under either ABI. Exactly one class uses
+`V8_ABSTRACT_OBJECT` and exactly one class derives from it, so it stays four
+small edits.
 
-### Why ≥ 15.x needs an SDK you probably lack
+### The Windows SDK pin
 
-V8 15.3 hardcodes `SDK_VERSION = '10.0.28000.0'` (in
-`build/toolchain/win/setup_toolchain.py` and `build/vs_toolchain.py`) and sets
-`NTDDI_VERSION=NTDDI_WIN11_BR`. On a machine with SDK 10.0.26100.0 the NTDDI
-symbol is undefined, so it expands to `0` and **every** version gate in the SDK's
-own headers closes, producing baffling errors like `fileapi.h` not knowing
-`FILE_INFO_BY_HANDLE_CLASS`. 14.8.180 wants 10.0.26100.0 and `NTDDI_WIN11_GE`,
-so it needs no such patching.
+15.x hardcodes `SDK_VERSION = '10.0.28000.0'` (in `build/vs_toolchain.py` and
+`build/toolchain/win/setup_toolchain.py`) and `NTDDI_VERSION=NTDDI_WIN11_BR`.
+With an older SDK that does not fail cleanly: the NTDDI symbol is simply
+undefined, expands to `0`, and **every** version gate in the SDK's own headers
+closes — surfacing as things like `fileapi.h` not knowing
+`FILE_INFO_BY_HANDLE_CLASS`.
 
-## The two source patches
+The script finds the newest SDK actually installed and retargets both, picking
+the NTDDI symbol by **value** rather than name (the two-letter suffixes — `ZN`,
+`GA`, `GE`, `BR` — do not sort in release order). It leaves them alone when the
+pinned SDK is present. These files live in `build/`, a separate gclient repo,
+which is why the edits happen after the sync and are reverted before the next
+one.
 
-Both exist because V8 is developed against libc++, while
-`use_custom_libcxx = false` — required so the library interoperates with a
-project built against MSVC's STL — gives it MSVC's. Both are in code upstream's
-Windows bots evidently do not compile. The script applies them and reports if a
-pattern is absent, so a future version that fixes them upstream is handled.
+## The source patches
+
+Most exist because V8 is developed against libc++ and its Windows bots evidently
+do not compile this code, while `use_custom_libcxx = false` — required so the
+library interoperates with a project built against MSVC's STL — gives it MSVC's.
+Each is applied by exact text match; a version where the text is absent is
+reported and skipped, so both older versions and ones upstream has since fixed
+are handled without editing this list.
 
 | File | Change | Why |
 |---|---|---|
-| `src/runtime/runtime-test.cc` | `std::atomic_flag f{false}` → `std::atomic_flag f` | `atomic_flag(bool)` is a libc++ extension; the standard and MSVC provide only a default constructor |
-| `src/objects/backing-store.cc` | `gc_retry` parameter `const std::function<bool()>&` → `auto&&` | MSVC's `std::function` inherits `operator()` from `_Func_class`, so V8's `ExtractCallableRunTypeImpl<Callable::*>` trait never matches |
+| `src/runtime/runtime-test.cc` | `std::atomic_flag f{false}` → `std::atomic_flag f` | `atomic_flag(bool)` is a libc++ extension; the standard and MSVC provide only a default constructor. **Fixed upstream by 15.6** |
+| `src/objects/backing-store.cc` | `gc_retry` parameter `const std::function<bool()>&` → `auto&&` | MSVC's `std::function` inherits `operator()` from `_Func_class`, so V8's `ExtractCallableRunTypeImpl<Callable::*>` trait never matches. Arrived with `RetryCustomAllocate` in 14.4 |
+| `src/objects/map.h` | reserve `extended_base_padding_[kTaggedSize - 1]` | gives `ExtendedMap` the same size under both ABIs — see above |
+| `src/objects/map.tq` | declare the same padding | so Torque's `kSize` matches `sizeof` |
+| `src/objects/js-interceptor-map.h` | `extended_padding_[kTaggedSize - 2]` → `[- 1]` | `ExtendedMap` no longer donates a byte, so its one subclass pads a byte further |
+| `src/objects/js-interceptor-map.tq` | `extended_padding[2]`→`[3]`, `[6]`→`[7]` | the same, for both tagged-pointer sizes |
 
-The second arrived with `RetryCustomAllocate` (2025-11-24, V8 14.4), so it
-affects 14.4 onwards.
+## Temporal
+
+`Temporal` is implemented in Rust (`//third_party/rust/temporal_capi`), and that
+is awkward for a single-archive build. `v8_static_library` sets gn's
+`complete_static_lib`, which archives transitive **C++** objects but not Rust
+rlibs — so the monolith references `temporal_rs_*` without containing it, and a
+consumer gets about twenty undefined symbols at link time.
+
+The build therefore folds the Rust graph into the archive after linking it:
+every `.rlib` under the objdir plus the locally built Rust sysroot, ~50
+archives. `lld-link` doubles as the librarian, so this needs no tool the build
+did not already require, and the Rust toolchain itself comes from `gclient` —
+Temporal adds no host prerequisite.
+
+Two details cost time to find:
+
+* **`clang_rt.builtins` has to go in too.** Rust's f16 helpers (`__extendhfsf2`,
+  `__truncsfhf2`) live there and nothing else in the archive supplies them.
+  Without it you are left with exactly those two undefined symbols.
+* **`lld-link`'s `/lib` must be the literal first argument.** Inside a response
+  file it is ignored with a warning, and the invocation silently becomes a link,
+  which then fails for unrelated-looking reasons (`subsystem must be defined`).
+
+It also drags in system libraries V8 alone never needed: Rust's standard library
+reaches `ntdll` directly, so a consumer links `ntdll.lib`, `userenv.lib` and
+`bcrypt.lib` on top of the usual set. Each archive's `README.txt` lists them.
+
+Temporal is built in but still behind a runtime flag — enable it with
+`--harmony-temporal`. `-Temporal:$false` turns the whole thing off, and then no
+merge happens.
 
 ## Prerequisites
 
@@ -124,8 +191,8 @@ affects 14.4 onwards.
 | Visual Studio with ClangCL | V8 builds with clang-cl, not MSVC proper |
 | Windows SDK | 10.0.26100.0 for 14.8.x; see the version table |
 | Python 3, git | depot_tools needs both |
-| ~10 GB disk | measured cold, one x86 Release: 4.9 GB checkout, 2.7 GB build output, 1.0 GB library, 0.7 GB depot_tools |
-| ~11 min on 32 cores | cold, end to end; 7 of that is ninja. Budget an hour or two on 4 cores |
+| ~12 GB disk | measured for one x86 Release with Temporal: 5.4 GB checkout, 4.8 GB build output, 1.2 GB library, 0.6 GB depot_tools. Debug is ~2 GB more |
+| Time | ~11 min cold on 32 cores without Temporal; Temporal adds a Rust sysroot build. Budget an hour or two on 4 cores |
 
 depot_tools is fetched into `-Root` by the script.
 
@@ -169,11 +236,22 @@ v8_use_external_startup_data = false
 use_custom_libcxx = false       # MSVC's STL, not the bundled libc++
 v8_generate_external_defines_header = true   # emits include/v8-gn.h
 v8_enable_pointer_compression   # true on x64, unsupported on x86
-v8_enable_sandbox               # true on x64; needs the external code space,
-                                # which needs pointer compression
+v8_enable_sandbox = false       # unavailable here - see below
+enable_iterator_debugging = false   # Debug does not compile otherwise
 v8_enable_i18n_support = false
 v8_enable_webassembly = false
-v8_enable_temporal_support = false
+v8_enable_temporal_support = true   # needs the Rust merge - see below
+```
+
+**The sandbox cannot be enabled**, on any architecture. `BUILD.gn` asserts it
+needs libc++ hardening, and that is `use_safe_libcxx = use_custom_libcxx &&
+enable_safe_libcxx` — so it requires V8's bundled libc++, which this build must
+not use if the result is to link against a project compiled with MSVC's STL.
+`gn gen` fails outright rather than degrading:
+
+```
+ERROR at //BUILD.gn:812:1: Assertion failed.
+assert(!v8_enable_sandbox || use_safe_libcxx, "The sandbox requires libc++ hardening")
 ```
 
 **`/MT` comes for free.** Chromium's `build/config/win/BUILD.gn` selects the CRT
@@ -203,11 +281,18 @@ workflow always passes it. For each one the script:
    which the build otherwise needs;
 4. loads the DLL from a host process of the right bitness (a 32-bit DLL needs
    32-bit PowerShell) and calls into it, which initialises V8, creates an
-   isolate and a context, and evaluates `40 + 2`.
+   isolate and a context, and evaluates two expressions: `40 + 2`, and a
+   `Temporal.PlainDate` difference that must come out as 38 days.
 
 Step 4 is the one that matters. An archive can be well-formed, correctly sized
 and full of the right symbols while still being unable to initialise — the
-CRT-directive check alone never catches that.
+CRT-directive check alone never catches that. The Temporal expression earns its
+place separately: those symbols come from archives merged in after the fact, and
+linking proves only that they exist, not that they run.
+
+The Debug configurations also compile the embedder with
+`/D_HAS_ITERATOR_DEBUGGING=0`, so the requirement that imposes on consumers is
+exercised on every build rather than merely written down here.
 
 ## Continuous integration
 
@@ -224,16 +309,14 @@ A `plan` job expands that into a `strategy.matrix`, which cannot be done from a
 Building them in one job instead is not an option — four in sequence would run
 past GitHub's 360-minute job ceiling.
 
-`plan` also validates the tag before a runner spends anything on a sync, and
-**drops** the 32-bit cells when the version is past 14.8.x rather than letting
-them fail mid-build, so `all` on a 15.x tag still builds its 64-bit half. If the
-selection leaves nothing, it fails there with that as the reason.
+`plan` also validates the tag before a runner spends anything on a multi-gigabyte
+sync.
 
-Neither disk nor time is especially tight. A cold x86 Release run measures
-**9.3 GB** all in against the ~33 GB free on a hosted runner, and **~11 minutes**
-on 32 cores — 7 of which is ninja. A runner has 4 cores, so expect an hour or
+Neither disk nor time is especially tight. One x86 Release configuration
+measures ~12 GB against the ~33 GB free on a hosted runner, and ~11 minutes on
+32 cores before Temporal is counted. A runner has 4 cores, so expect an hour or
 two; `timeout-minutes` is set well above that rather than close to it, because
-a timeout loses the whole run. A 64-bit Debug build is larger on both axes.
+a timeout loses the whole run. Debug is larger on both axes.
 
 Most of the disk saving is the shallow clone: V8's full history is ~2 GB of
 `.git` against 36 MB for a single tag.
