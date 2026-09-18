@@ -144,8 +144,11 @@ jobs:
           # rather than failing on the name.
           overwrite: true
 
-      - name: Upload logs on failure
-        if: failure()
+      # Always, not only on failure: a cancelled job is not a failed one, and a
+      # run stalled long enough to be killed by hand is exactly the one whose
+      # logs are wanted afterwards.
+      - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ matrix.arch }}-${{ matrix.config }}
