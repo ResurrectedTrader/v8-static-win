@@ -95,6 +95,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # PowerShell only discovers that a function does not exist when the line
+      # calling it runs, and in this script that can be an hour in. Cheaper to
+      # ask the parser first.
+      - name: Check the build script
+        shell: pwsh
+        run: .\check-script.ps1 .\build-v8.ps1
+
       # The build root is outside the workspace; depot_tools and the V8 checkout
       # are large and unrelated to the repo contents.
       # -Verify links and runs a DLL against the result, so a library that
