@@ -102,6 +102,30 @@ jobs:
         shell: pwsh
         run: .\check-script.ps1 .\build-v8.ps1
 
+      # Build on D:, the runner's local temp disk, rather than C:, the OS disk.
+      # Measured on this image against the same 72,349-file extraction, D: ran
+      # seven times faster than C: (5,467 files/sec against 795). A gclient sync
+      # writes several hundred thousand files, so the same difference applies
+      # here even though this build has never been as visibly slow as unpacking
+      # a source tarball.
+      #
+      # Falls back to C: rather than assuming D: exists and is big enough: it is
+      # image-dependent, the checkout plus objdir needs far more room than the
+      # SpiderMonkey build does, and running out of space fails late.
+      - name: Choose a build root
+        shell: pwsh
+        run: |
+          $root = 'C:\v8b'
+          $d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='D:'" -ErrorAction SilentlyContinue
+          if ($d -and $d.FreeSpace -gt 100GB) {
+            $root = 'D:\v8b'
+          } else {
+            "no D: with 100 GB free - falling back to $root"
+          }
+          "V8_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $free = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($root.Substring(0,2))'").FreeSpace
+          "build root: $root ({0:N0} GB free)" -f ($free / 1GB)
+
       # The build root is outside the workspace; depot_tools and the V8 checkout
       # are large and unrelated to the repo contents.
       # -Verify links and runs a DLL against the result, so a library that
@@ -110,7 +134,7 @@ jobs:
         shell: pwsh
         run: |
           .\build-v8.ps1 `
-            -Root C:\v8b `
+            -Root ${{ env.V8_ROOT }} `
             -Version ${{ inputs.version }} `
             -Arch ${{ matrix.arch }} `
             -Config ${{ matrix.config }} `
@@ -124,7 +148,7 @@ jobs:
         shell: pwsh
         run: |
           $tag  = "${{ matrix.arch }}-$("${{ matrix.config }}".ToLower())"
-          $dist = "C:\v8b\dist-$tag"
+          $dist = "$env:V8_ROOT\dist-$tag"
           if (-not (Test-Path "$dist\v8_monolith.lib")) { throw "no library at $dist" }
           if (-not (Test-Path "$dist\include\v8-gn.h"))  { throw "no v8-gn.h at $dist" }
           if (-not (Test-Path "$dist\toolset.txt"))      { throw "no toolset.txt at $dist" }
@@ -162,7 +186,7 @@ jobs:
           # Every log the build writes, not just the compiler's: a failure
           # during the sync happens before build-*.log exists, and uploading
           # nothing is how that failure becomes undiagnosable.
-          path: C:\v8b\*.log
+          path: ${{ env.V8_ROOT }}\*.log
           retention-days: 7
           if-no-files-found: ignore
           overwrite: true
