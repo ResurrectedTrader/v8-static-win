@@ -79,6 +79,7 @@ $ProgressPreference    = 'SilentlyContinue'
 
 function Info { param($m) Write-Host "==> $m" -ForegroundColor Cyan }
 function Ok   { param($m) Write-Host "    $m" -ForegroundColor Green }
+function Warn { param($m) Write-Host "    $m" -ForegroundColor Yellow }
 function Die  { param($m) Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
 
 # Native tools write progress to stderr; under $ErrorActionPreference='Stop'
@@ -183,13 +184,33 @@ solutions = [
         Ok "v8 at $($script:desc[0])"
     } finally { Pop-Location }
 
+    # Kept in a log rather than on the console: a successful sync prints
+    # thousands of lines, and a failed one prints the reason somewhere in the
+    # middle of them. Discarding it entirely - as this used to - leaves nothing
+    # to diagnose from but the exit code.
+    #
+    # Retried because it fetches from several hosts and a transient failure on
+    # any of them fails the whole sync; Chromium's own infrastructure retries
+    # for the same reason.
+    $syncLog = Join-Path $Root 'sync.log'
     Info 'gclient sync (downloads dependencies)'
     Push-Location $Root
     try {
-        Invoke-Native {
-            & (Join-Path $DepotTools 'gclient.bat') sync -D --no-history --shallow 2>&1 |
-                Select-String -Pattern 'error|Error|fatal' | Out-Null
-        } 'gclient sync'
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            Invoke-Native {
+                & (Join-Path $DepotTools 'gclient.bat') sync -D --no-history --shallow *> $syncLog
+            } 'gclient sync' -AllowFailure
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -ge 3) {
+                Get-Content $syncLog -Tail 30
+                Die "gclient sync failed after $attempt attempts (exit $LASTEXITCODE); see $syncLog"
+            }
+            Warn "sync attempt $attempt failed (exit $LASTEXITCODE) - retrying"
+            Start-Sleep -Seconds (10 * $attempt)
+        }
+        if ($attempt -gt 1) { Ok "synced on attempt $attempt" }
     } finally { Pop-Location }
 
     # Verify the dependency actually moved: a silent sync failure leaves build/
